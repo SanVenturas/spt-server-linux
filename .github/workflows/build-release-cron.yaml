@@ -148,7 +148,7 @@ jobs:
           echo "Client version is $CLIENT_VERSION"
           echo "SPT version is $SPT_VERSION"
 
-  build-server:
+    build-server:
     needs: prepare
     if: needs.prepare.outputs.proceed == 'true'
     runs-on: ubuntu-latest
@@ -194,7 +194,7 @@ jobs:
           cd /workspace/SPT/Build/server/project
           BUILD_TYPE="${{ needs.prepare.outputs.build_type }}"
           echo "Running build for $BUILD_TYPE on Linux ARM64"
-          npm run build:$BUILD_TYPE -- --arch=arm64 --platform=linux
+          npm run build:$BUILD_TYPE -- --arch=arm64 --platform=linux  # 修改为 --platform=linux
           printf "\nBuilt for Linux ARM64!\n\n"
 
       - name: Upload Server Artifact
