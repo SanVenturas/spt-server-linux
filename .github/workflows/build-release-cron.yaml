@@ -1,4 +1,4 @@
-name: SPT Release Build
+name: SPT Release Build - Linux ARM64
 
 on:
   schedule:
@@ -13,7 +13,7 @@ on:
         type: string
 
 concurrency:
-  group: spt-release-build
+  group: spt-release-build-linux-arm64
   cancel-in-progress: true
 
 jobs:
@@ -162,3 +162,240 @@ jobs:
 
           echo "Client version is $CLIENT_VERSION"
           echo "SPT version is $SPT_VERSION"
+
+  build-server:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: refringe/spt-build-node:1.0.9
+    outputs:
+      server_commit: ${{ steps.clone-server.outputs.server_commit }}
+    steps:
+      - name: Clone Server
+        id: clone-server
+        shell: bash
+        run: |
+          rm -rf /workspace/SPT/Build/server
+          if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
+            BRANCH=${{ needs.prepare.outputs.branch_server }}
+            echo "Cloning branch $BRANCH"
+            git clone https://github.com/sp-tarkov/server.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/server
+          else
+            TAG=${{ needs.prepare.outputs.target_tag }}
+            echo "Cloning tag $TAG"
+            git clone https://github.com/sp-tarkov/server.git --branch "$TAG" --depth 1 /workspace/SPT/Build/server
+          fi
+
+          cd /workspace/SPT/Build/server
+          echo "server_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Pull LFS Files
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/server
+          git lfs install --local
+          git lfs pull
+
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/server/project
+          npm install
+
+      - name: Build Server for Linux ARM64
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/server/project
+          BUILD_TYPE="${{ needs.prepare.outputs.build_type }}"
+          echo "Running build for $BUILD_TYPE on Linux ARM64"
+          npm run build:$BUILD_TYPE -- --arch=arm64 --platform=linux
+          printf "\nBuilt for Linux ARM64!\n\n"
+
+      - name: Upload Server Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-artifact-linux-arm64
+          path: /workspace/SPT/Build/server/project/build/
+          retention-days: 1
+          if-no-files-found: error
+
+  build-modules:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: refringe/spt-build-dotnet:1.0.0
+    steps:
+      - name: Clone Modules
+        id: clone-modules
+        shell: bash
+        run: |
+          rm -rf /workspace/SPT/Build/modules
+          if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
+            BRANCH=${{ needs.prepare.outputs.branch_modules }}
+            echo "Cloning modules from branch $BRANCH"
+            git clone https://github.com/sp-tarkov/modules.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/modules
+          else
+            TAG=${{ needs.prepare.outputs.target_tag }}
+            echo "Cloning modules from tag $TAG"
+            git clone https://github.com/sp-tarkov/modules.git --branch "$TAG" --depth 1 /workspace/SPT/Build/modules
+          fi
+
+          cd /workspace/SPT/Build/modules
+          echo "modules_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Download Client Module Package
+        shell: bash
+        env:
+          MODULE_DOMAIN: ${{ secrets.MODULE_DOMAIN }}
+        run: |
+          DIR_MANAGED="/workspace/SPT/Build/modules/project/Shared/Managed"
+          DOWNLOAD_PATH="$DIR_MANAGED/${{ needs.prepare.outputs.client_version }}.7z"
+          DOWNLOAD_URL="${MODULE_DOMAIN}/${{ needs.prepare.outputs.client_version }}.7z"
+          echo "Downloading Client Module Package from $DOWNLOAD_URL to $DOWNLOAD_PATH"
+          mkdir -p "$DIR_MANAGED"
+          wget -q -O "$DOWNLOAD_PATH" "$DOWNLOAD_URL" || {
+            echo "Failed to download the module package."
+            exit 1
+          }
+          if [ ! -s "$DOWNLOAD_PATH" ]; then
+            echo "The module package does not exist or is empty."
+            exit 1
+          fi
+          echo "Download Successful: $DOWNLOAD_PATH"
+
+      - name: Decompress Client Module Package
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/modules/project/Shared/Managed
+          7z x ${{ needs.prepare.outputs.client_version }}.7z -aoa
+          echo "Client module package decompressed."
+
+      - name: Delete Client Module Package
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/modules/project/Shared/Managed
+          rm -f ${{ needs.prepare.outputs.client_version }}.7z
+          echo "Client module package deleted."
+
+      - name: Build Modules
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/modules/project
+          dotnet build -c Release -p:Version=${{ needs.prepare.outputs.spt_version }}
+          printf "\nBuilt!\n\n"
+
+      - name: Upload Modules Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-artifact-linux-arm64
+          path: /workspace/SPT/Build/modules/project/Build
+          retention-days: 1
+          if-no-files-found: error
+
+  build-launcher:
+    needs: prepare
+    if: needs.prepare.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: refringe/spt-build-dotnet:1.0.0
+    steps:
+      - name: Clone Launcher
+        id: clone-launcher
+        shell: bash
+        run: |
+          rm -rf /workspace/SPT/Build/launcher
+          if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
+            BRANCH=${{ needs.prepare.outputs.branch_launcher }}
+            echo "Cloning launcher from branch $BRANCH"
+            git clone https://github.com/sp-tarkov/launcher.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/launcher
+          else
+            TAG=${{ needs.prepare.outputs.target_tag }}
+            echo "Cloning launcher from tag $TAG"
+            git clone https://github.com/sp-tarkov/launcher.git --branch "$TAG" --depth 1 /workspace/SPT/Build/launcher
+          fi
+
+          cd /workspace/SPT/Build/launcher
+          echo "launcher_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build Launcher
+        shell: bash
+        run: |
+          cd /workspace/SPT/Build/launcher/project
+          dotnet build
+          printf "\nBuilt!\n\n"
+
+      - name: Upload Launcher Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-artifact-linux-arm64
+          path: /workspace/SPT/Build/launcher/project/Build
+          retention-days: 1
+          if-no-files-found: error
+
+  assemble-and-publish:
+    needs: [prepare, build-server, build-modules, build-launcher]
+    runs-on: ubuntu-latest
+    container:
+      image: refringe/spt-build-node:1.0.9
+    steps:
+      - name: Clean Directory
+        shell: bash
+        run: |
+          rm -rf release build
+          mkdir -p release
+
+      - name: Download Server Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: server-artifact-linux-arm64
+          path: release/
+
+      - name: Download Modules Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: modules-artifact-linux-arm64
+          path: release/
+
+      - name: Download Launcher Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: launcher-artifact-linux-arm64
+          path: release/
+
+      - name: Clone Build Project
+        uses: actions/checkout@v4
+        with:
+          repository: sp-tarkov/build
+          path: build
+
+      - name: Merge Static Assets and Dynamic Files
+        shell: bash
+        run: cp -rvf build/static-assets/* release/
+
+      - name: List Release Contents
+        shell: bash
+        run: tree release
+
+      - name: Generate Release Filename
+        id: generate-filename
+        shell: bash
+        run: |
+          BUILD_TYPE=${{ needs.prepare.outputs.build_type }}
+          SPT_VERSION=${{ needs.prepare.outputs.spt_version }}
+          CLIENT_VERSION=${{ needs.prepare.outputs.client_version }}
+          SERVER_COMMIT=${{ needs.build-server.outputs.server_commit }}
+          TARGET_TAG=${{ needs.prepare.outputs.target_tag }}
+          DATE=$(date +%Y%m%d)
+
+          if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
+            BASE_NAME="SPT-NIGHTLY-${SPT_VERSION}-${CLIENT_VERSION}-${SERVER_COMMIT}-${DATE}-linux-arm64"
+          else
+            UPPER_BUILD_TYPE=$(echo "$BUILD_TYPE" | tr '[:lower:]' '[:upper:]')
+            UPPER_TARGET_TAG=$(echo "$TARGET_TAG" | tr '[:lower:]' '[:upper:]')
+
+            if [ "$BUILD_TYPE" = "release" ]; then
+              BASE_NAME="SPT-${SPT_VERSION}-${CLIENT_VERSION}-${SERVER_COMMIT}-linux-arm64"
+            else
+              TAG_PART
