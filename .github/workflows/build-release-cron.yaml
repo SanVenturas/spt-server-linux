@@ -1,156 +1,130 @@
-name: SPT-Server Build Release
+build-server:
+  needs: prepare
+  if: needs.prepare.outputs.proceed == 'true'
+  runs-on: ubuntu-latest
+  container:
+    image: refringe/spt-build-node:1.0.9
+  outputs:
+    server_commit: ${{ steps.clone-server.outputs.server_commit }}
+  steps:
+    - name: Clone Server
+      id: clone-server
+      shell: bash
+      run: |
+        rm -rf /workspace/SPT/Build/server
+        if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
+          BRANCH=${{ needs.prepare.outputs.branch_server }}
+          echo "Cloning branch $BRANCH"
+          git clone https://github.com/sp-tarkov/server.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/server
+        else
+          TAG=${{ needs.prepare.outputs.target_tag }}
+          echo "Cloning tag $TAG"
+          git clone https://github.com/sp-tarkov/server.git --branch "$TAG" --depth 1 /workspace/SPT/Build/server
+        fi
 
-on:
-  schedule:
-    - cron: '0 2 * * *'
-  push:
-    paths:
-      - '.github/workflows/build-release-cron.yaml'
+        cd /workspace/SPT/Build/server
+        echo "server_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-env:
-  SERVER_URL: https://github.com
-  REPOSITORY_SPT_SERVER: sp-tarkov/server
-  RELEASE_BRANCH: master
+    - name: Pull LFS Files
+      shell: bash
+      run: |
+        cd /workspace/SPT/Build/server
+        git lfs install --local
+        git lfs pull
 
-jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      PROCEED: ${{ steps.compare-tags.outputs.PROCEED }}
-      BUILT_TAG: ${{ steps.compare-tags.outputs.BUILT_TAG }}
-      TARGET_TAG: ${{ steps.compare-tags.outputs.TARGET_TAG }}
+    - name: Install Dependencies
+      shell: bash
+      run: |
+        cd /workspace/SPT/Build/server/project
+        npm install
 
-      SPT_VERSION: ${{ steps.versions.outputs.SPT_VERSION }}
-      EFT_VERSION: ${{ steps.versions.outputs.EFT_VERSION }}
-      BUILD_DATE: ${{ steps.versions.outputs.DATE }}
-      BUILD_DATE_TIME: ${{ steps.versions.outputs.DATE_TIME }}
+    - name: Build Server
+      shell: bash
+      run: |
+        cd /workspace/SPT/Build/server/project
+        BUILD_TYPE="${{ needs.prepare.outputs.build_type }}"
+        echo "Running build for $BUILD_TYPE"
+        npm run build:$BUILD_TYPE -- --arch=arm64 --platform=linux
+        printf "\nBuilt!\n\n"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+    - name: Upload Server Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: server-artifact
+        path: /workspace/SPT/Build/server/project/build/
+        retention-days: 1
+        if-no-files-found: error
 
-      - name: Get Latest Tag From SPT
-        id: get-latest-tag
-        run: |
-          git clone -b ${{ env.RELEASE_BRANCH }} ${{ env.SERVER_URL }}/${{ env.REPOSITORY_SPT_SERVER }}.git Server
-          cd Server
-          SPT_SERVER_LATEST_TAG=$(git describe --tags --abbrev=0)
-          echo "SPT_SERVER_LATEST_TAG=$SPT_SERVER_LATEST_TAG" >> $GITHUB_OUTPUT
-        shell: bash
+build-modules:
+  needs: prepare
+  if: needs.prepare.outputs.proceed == 'true'
+  runs-on: ubuntu-latest
+  container:
+    image: refringe/spt-build-dotnet:1.0.0
+  steps:
+    - name: Clone Modules
+      id: clone-modules
+      shell: bash
+      run: |
+        rm -rf /workspace/SPT/Build/modules
+        if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
+          BRANCH=${{ needs.prepare.outputs.branch_modules }}
+          echo "Cloning modules from branch $BRANCH"
+          git clone https://github.com/sp-tarkov/modules.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/modules
+        else
+          TAG=${{ needs.prepare.outputs.target_tag }}
+          echo "Cloning modules from tag $TAG"
+          git clone https://github.com/sp-tarkov/modules.git --branch "$TAG" --depth 1 /workspace/SPT/Build/modules
+        fi
 
-      - name: Compare Tags
-        id: compare-tags
-        run: |
-          server_last_built_tag=$(cat trigger.release | grep 'server=' | cut -d'=' -f2)
-          server_latest_tag=${{ steps.get-latest-tag.outputs.SPT_SERVER_LATEST_TAG }}
-          if [ "$server_last_built_tag" != "$server_latest_tag" ]; then
-            echo "BUILT_TAG=$server_last_built_tag" >> $GITHUB_OUTPUT
-            echo "TARGET_TAG=$server_latest_tag" >> $GITHUB_OUTPUT
-            echo "PROCEED=true" >> $GITHUB_OUTPUT
-          else
-            echo "PROCEED=false" >> $GITHUB_OUTPUT
-          fi
-        shell: bash
+        cd /workspace/SPT/Build/modules
+        echo "modules_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Extract versions
-        id: versions
-        if: steps.compare-tags.outputs.PROCEED == 'true'
-        run: |
-          cd Server
-          SERVER_TAG=${{ steps.get-latest-tag.outputs.SPT_SERVER_LATEST_TAG }}
-          git checkout $SERVER_TAG
-          SPT_VERSION=$(jq -r '.sptVersion' project/assets/configs/core.json)
-          EFT_VERSION=$(jq -r '.compatibleTarkovVersion' project/assets/configs/core.json)
+    - name: Download Client Module Package
+      shell: bash
+      env:
+        MODULE_DOMAIN: ${{ secrets.MODULE_DOMAIN }}
+      run: |
+        DIR_MANAGED="/workspace/SPT/Build/modules/project/Shared/Managed"
+        DOWNLOAD_PATH="$DIR_MANAGED/${{ needs.prepare.outputs.client_version }}.7z"
+        DOWNLOAD_URL="${MODULE_DOMAIN}/${{ needs.prepare.outputs.client_version }}.7z"
+        echo "Downloading Client Module Package from $DOWNLOAD_URL to $DOWNLOAD_PATH"
+        mkdir -p "$DIR_MANAGED"
+        wget -q -O "$DOWNLOAD_PATH" "$DOWNLOAD_URL" || {
+          echo "Failed to download the module package."
+          exit 1
+        }
+        if [ ! -s "$DOWNLOAD_PATH" ]; then
+          echo "The module package does not exist or is empty."
+          exit 1
+        fi
+        echo "Download Successful: $DOWNLOAD_PATH"
 
-          echo "SPT_VERSION=$SPT_VERSION" >> $GITHUB_OUTPUT
-          echo "EFT_VERSION=$EFT_VERSION" >> $GITHUB_OUTPUT
+    - name: Decompress Client Module Package
+      shell: bash
+      run: |
+        cd /workspace/SPT/Build/modules/project/Shared/Managed
+        7z x ${{ needs.prepare.outputs.client_version }}.7z -aoa
+        echo "Client module package decompressed."
 
-          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
-          echo "DATE_TIME=$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
-        shell: bash
+    - name: Delete Client Module Package
+      shell: bash
+      run: |
+        cd /workspace/SPT/Build/modules/project/Shared/Managed
+        rm -f ${{ needs.prepare.outputs.client_version }}.7z
+        echo "Client module package deleted."
 
-  build-server-linux:
-    needs: prepare
-    if: ${{ needs.prepare.outputs.PROCEED == 'true' }}
-    runs-on: ubuntu-latest
-    env:
-      OUTPUT_DIR: spt-server
-      SOURCECODE_DIR: ${{ github.workspace }}/code
+    - name: Build Modules
+      shell: bash
+      run: |
+        cd /workspace/SPT/Build/modules/project
+        dotnet build -c Release -p:Version=${{ needs.prepare.outputs.spt_version }} -r linux-arm64
+        printf "\nBuilt!\n\n"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          lfs: false
-
-      - name: Clone Linux Server Code
-        run: |
-          git clone -b ${{ env.RELEASE_BRANCH }} ${{ env.SERVER_URL }}/${{ env.REPOSITORY_SPT_SERVER }}.git ${{ env.SOURCECODE_DIR }}
-        shell: bash
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20.11.1
-
-      - name: Install NPM Dependencies
-        run: |
-          cd ${{ env.SOURCECODE_DIR }}/project
-          npm install
-        shell: bash
-
-      - name: Build Linux Server
-        run: |
-          cd ${{ env.SOURCECODE_DIR }}/project
-          npm run build:release
-          mv build ${{ env.OUTPUT_DIR }}
-        shell: bash
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.OUTPUT_DIR }}
-          path: ${{ env.SOURCECODE_DIR }}/project/${{ env.OUTPUT_DIR }}
-          overwrite: true
-
-  assemble-and-publish:
-    needs: [prepare, build-server-linux]
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Push Code To GitHub
-        run: |
-          git pull
-          echo "server=${{ needs.prepare.outputs.TARGET_TAG }}" > trigger.release
-          git add trigger.release
-          git commit -m "Update trigger.release"
-          git push
-        shell: bash
-
-      - name: Download Linux Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.build-server-linux.outputs.LINUX_ARTIFACT }}
-          path: linux
-
-      - name: Compress and Publish
-        run: |
-          cd linux
-          zip -r ../release.zip *
-          ls -R ..
-        shell: bash
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: ${{ needs.prepare.outputs.TARGET_TAG }}
-          tag_name: ${{ needs.prepare.outputs.TARGET_TAG }}
-          files: |
-            release.zip
+    - name: Upload Modules Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: modules-artifact
+        path: /workspace/SPT/Build/modules/project/Build
+        retention-days: 1
+        if-no-files-found: error
