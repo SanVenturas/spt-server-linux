@@ -1,130 +1,164 @@
-build-server:
-  needs: prepare
-  if: needs.prepare.outputs.proceed == 'true'
-  runs-on: ubuntu-latest
-  container:
-    image: refringe/spt-build-node:1.0.9
-  outputs:
-    server_commit: ${{ steps.clone-server.outputs.server_commit }}
-  steps:
-    - name: Clone Server
-      id: clone-server
-      shell: bash
-      run: |
-        rm -rf /workspace/SPT/Build/server
-        if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
-          BRANCH=${{ needs.prepare.outputs.branch_server }}
-          echo "Cloning branch $BRANCH"
-          git clone https://github.com/sp-tarkov/server.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/server
-        else
-          TAG=${{ needs.prepare.outputs.target_tag }}
-          echo "Cloning tag $TAG"
-          git clone https://github.com/sp-tarkov/server.git --branch "$TAG" --depth 1 /workspace/SPT/Build/server
-        fi
+name: SPT Release Build
 
-        cd /workspace/SPT/Build/server
-        echo "server_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+on:
+  schedule:
+    - cron: "0 4 * * *" # Nightly should trigger at 4am UTC (11pm EST).
+  repository_dispatch:
+    types: [build-trigger]
+  workflow_dispatch:
+    inputs:
+      buildTag:
+        description: "The tag to build on"
+        required: true
+        type: string
 
-    - name: Pull LFS Files
-      shell: bash
-      run: |
-        cd /workspace/SPT/Build/server
-        git lfs install --local
-        git lfs pull
+concurrency:
+  group: spt-release-build
+  cancel-in-progress: true
 
-    - name: Install Dependencies
-      shell: bash
-      run: |
-        cd /workspace/SPT/Build/server/project
-        npm install
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    container:
+      image: refringe/spt-build-node:1.0.9
+    outputs:
+      proceed: ${{ steps.check-existence.outputs.proceed }}
+      is_nightly: ${{ steps.determine-context.outputs.is_nightly }}
+      branch_server: ${{ steps.determine-context.outputs.branch_server }}
+      branch_modules: ${{ steps.determine-context.outputs.branch_modules }}
+      branch_launcher: ${{ steps.determine-context.outputs.branch_launcher }}
+      target_tag: ${{ steps.determine-context.outputs.target_tag }}
+      build_type: ${{ steps.determine-build-type.outputs.build_type }}
+      client_version: ${{ steps.versions.outputs.client_version }}
+      spt_version: ${{ steps.versions.outputs.spt_version }}
 
-    - name: Build Server
-      shell: bash
-      run: |
-        cd /workspace/SPT/Build/server/project
-        BUILD_TYPE="${{ needs.prepare.outputs.build_type }}"
-        echo "Running build for $BUILD_TYPE"
-        npm run build:$BUILD_TYPE -- --arch=arm64 --platform=linux
-        printf "\nBuilt!\n\n"
+    steps:
+      - name: Determine Build Context
+        id: determine-context
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CLIENT_PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          WORKFLOW_INPUT_TAG: ${{ github.event.inputs.buildTag }}
+        run: |
+          echo "Determining build context..."
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            echo "is_nightly=true" >> $GITHUB_OUTPUT
+            echo "branch_server=4.0.0-DEV" >> $GITHUB_OUTPUT
+            echo "branch_modules=4.0.0-DEV" >> $GITHUB_OUTPUT
+            echo "branch_launcher=4.0.0-DEV" >> $GITHUB_OUTPUT
+            echo "Context is nightly build"
+          else
+            echo "is_nightly=false" >> $GITHUB_OUTPUT
+            # Determine the tag based on the event type
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              TAG_NAME="$WORKFLOW_INPUT_TAG"
+            elif [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+              TAG_NAME="$CLIENT_PAYLOAD_TAG"
+            else
+              echo "Unsupported event: $EVENT_NAME"
+              exit 1
+            fi
 
-    - name: Upload Server Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: server-artifact
-        path: /workspace/SPT/Build/server/project/build/
-        retention-days: 1
-        if-no-files-found: error
+            if [[ -z "$TAG_NAME" ]]; then
+              echo "No tag provided in event payload."
+              exit 1
+            fi
+            echo "target_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "Target tag is $TAG_NAME"
+          fi
 
-build-modules:
-  needs: prepare
-  if: needs.prepare.outputs.proceed == 'true'
-  runs-on: ubuntu-latest
-  container:
-    image: refringe/spt-build-dotnet:1.0.0
-  steps:
-    - name: Clone Modules
-      id: clone-modules
-      shell: bash
-      run: |
-        rm -rf /workspace/SPT/Build/modules
-        if [[ "${{ needs.prepare.outputs.is_nightly }}" == "true" ]]; then
-          BRANCH=${{ needs.prepare.outputs.branch_modules }}
-          echo "Cloning modules from branch $BRANCH"
-          git clone https://github.com/sp-tarkov/modules.git --branch "$BRANCH" --depth 1 /workspace/SPT/Build/modules
-        else
-          TAG=${{ needs.prepare.outputs.target_tag }}
-          echo "Cloning modules from tag $TAG"
-          git clone https://github.com/sp-tarkov/modules.git --branch "$TAG" --depth 1 /workspace/SPT/Build/modules
-        fi
+      - name: Determine Build Type
+        id: determine-build-type
+        shell: bash
+        run: |
+          if [[ "${{ steps.determine-context.outputs.is_nightly }}" == "true" ]]; then
+            BUILD_TYPE="bleedingmods"
+          else
+            TARGET_TAG="${{ steps.determine-context.outputs.target_tag }}"
+            TARGET_TAG_UPPER="${TARGET_TAG^^}"
 
-        cd /workspace/SPT/Build/modules
-        echo "modules_commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+            BUILD_TYPE="debug"
+            if [[ "$TARGET_TAG_UPPER" =~ -BEM ]]; then
+              BUILD_TYPE="bleedingmods"
+            elif [[ "$TARGET_TAG_UPPER" =~ -BE ]]; then
+              BUILD_TYPE="bleeding"
+            elif [[ "$TARGET_TAG_UPPER" =~ v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              BUILD_TYPE="release"
+            fi
+          fi
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "Build type is $BUILD_TYPE"
 
-    - name: Download Client Module Package
-      shell: bash
-      env:
-        MODULE_DOMAIN: ${{ secrets.MODULE_DOMAIN }}
-      run: |
-        DIR_MANAGED="/workspace/SPT/Build/modules/project/Shared/Managed"
-        DOWNLOAD_PATH="$DIR_MANAGED/${{ needs.prepare.outputs.client_version }}.7z"
-        DOWNLOAD_URL="${MODULE_DOMAIN}/${{ needs.prepare.outputs.client_version }}.7z"
-        echo "Downloading Client Module Package from $DOWNLOAD_URL to $DOWNLOAD_PATH"
-        mkdir -p "$DIR_MANAGED"
-        wget -q -O "$DOWNLOAD_PATH" "$DOWNLOAD_URL" || {
-          echo "Failed to download the module package."
+      - name: Check Existence
+        id: check-existence
+        shell: bash
+        run: |
+          PROCEED="true"
+          if [[ "${{ steps.determine-context.outputs.is_nightly }}" == "true" ]]; then
+            declare -A BRANCHES=(
+              [Server]="https://github.com/sp-tarkov/server.git@${{ steps.determine-context.outputs.branch_server }}"
+              [Modules]="https://github.com/sp-tarkov/modules.git@${{ steps.determine-context.outputs.branch_modules }}"
+              [Launcher]="https://github.com/sp-tarkov/launcher.git@${{ steps.determine-context.outputs.branch_launcher }}"
+            )
+            for REPO_NAME in "${!BRANCHES[@]}"; do
+              REPO_URL="${BRANCHES[$REPO_NAME]%@*}"
+              BRANCH="${BRANCHES[$REPO_NAME]##*@}"
+              echo "Checking for branch $BRANCH in $REPO_NAME..."
+              if ! git ls-remote --heads $REPO_URL $BRANCH | grep -q $BRANCH; then
+                echo "Branch $BRANCH not found in $REPO_URL"
+                PROCEED="false"
+                break
+              fi
+            done
+          else
+            TAG="${{ steps.determine-context.outputs.target_tag }}"
+            REPOS=("https://github.com/sp-tarkov/server.git" "https://github.com/sp-tarkov/modules.git" "https://github.com/sp-tarkov/launcher.git")
+            for REPO in "${REPOS[@]}"; do
+              echo "Checking for tag $TAG in $REPO..."
+              if ! git ls-remote --tags $REPO $TAG | grep -q $TAG; then
+                echo "Tag $TAG not found in $REPO"
+                PROCEED="false"
+                break
+              fi
+            done
+          fi
+          echo "proceed=$PROCEED" >> $GITHUB_OUTPUT
+          echo "Matches found. Proceeding with build."
+
+      - name: Tag Not Found
+        if: steps.check-existence.outputs.proceed == 'false'
+        run: |
+          echo "Required branch/tag not found in one or more repositories, halting workflow."
           exit 1
-        }
-        if [ ! -s "$DOWNLOAD_PATH" ]; then
-          echo "The module package does not exist or is empty."
-          exit 1
-        fi
-        echo "Download Successful: $DOWNLOAD_PATH"
 
-    - name: Decompress Client Module Package
-      shell: bash
-      run: |
-        cd /workspace/SPT/Build/modules/project/Shared/Managed
-        7z x ${{ needs.prepare.outputs.client_version }}.7z -aoa
-        echo "Client module package decompressed."
+      - name: Extract Versions
+        id: versions
+        shell: bash
+        run: |
+          rm -rf /workspace/SPT/Build/server-core
+          git init /workspace/SPT/Build/server-core
+          cd /workspace/SPT/Build/server-core
+          git remote add origin https://github.com/sp-tarkov/server.git
+          git config core.sparseCheckout true
+          echo "project/assets/configs/core.json" >> .git/info/sparse-checkout
 
-    - name: Delete Client Module Package
-      shell: bash
-      run: |
-        cd /workspace/SPT/Build/modules/project/Shared/Managed
-        rm -f ${{ needs.prepare.outputs.client_version }}.7z
-        echo "Client module package deleted."
+          if [[ "${{ steps.determine-context.outputs.is_nightly }}" == "true" ]]; then
+            REF=${{ steps.determine-context.outputs.branch_server }}
+          else
+            REF=${{ steps.determine-context.outputs.target_tag }}
+          fi
 
-    - name: Build Modules
-      shell: bash
-      run: |
-        cd /workspace/SPT/Build/modules/project
-        dotnet build -c Release -p:Version=${{ needs.prepare.outputs.spt_version }} -r linux-arm64
-        printf "\nBuilt!\n\n"
+          git fetch --depth=1 origin "${REF}"
+          git checkout FETCH_HEAD
 
-    - name: Upload Modules Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: modules-artifact
-        path: /workspace/SPT/Build/modules/project/Build
-        retention-days: 1
-        if-no-files-found: error
+          cd project/assets/configs
+          SPT_VERSION=$(jq -r '.sptVersion' core.json)
+          FULL_VERSION=$(jq -r '.compatibleTarkovVersion' core.json)
+          CLIENT_VERSION=${FULL_VERSION##*.}
+
+          echo "client_version=$CLIENT_VERSION" >> $GITHUB_OUTPUT
+          echo "spt_version=$SPT_VERSION" >> $GITHUB_OUTPUT
+
+          echo "Client version is $CLIENT_VERSION"
+          echo "SPT version is $SPT_VERSION"
