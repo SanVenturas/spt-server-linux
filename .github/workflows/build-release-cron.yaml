@@ -1,224 +1,217 @@
-name: SPT-Server Build Release
+name: Linux Server Build and Docker Image
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  push:
-    paths:
-      - '.github/workflows/build-release-cron.yaml'
+    - cron: "0 4 * * *" # Nightly build at 4am UTC
+  repository_dispatch:
+    types: [build-trigger]
+  workflow_dispatch:
+    inputs:
+      buildTag:
+        description: "The tag to build on"
+        required: true
+        type: string
 
-env:
-  SERVER_URL: https://github.com
-  REPOSITORY_SPT_SERVER: sp-tarkov/server
-  REPOSITORY_SPT_SERVER_AIRRYCO: AirryCo/spt-server
-  RELEASE_BRANCH: master
-  RELEASE_BRANCH_FIKA: main
+concurrency:
+  group: linux-server-build
+  cancel-in-progress: true
 
 jobs:
   prepare:
     runs-on: ubuntu-latest
     outputs:
-      PROCEED: ${{ steps.compare-tags.outputs.PROCEED }}
-      BUILT_TAG: ${{ steps.compare-tags.outputs.BUILT_TAG }}
-      BUILT_TAG_FIKA: ${{ steps.get-fika-tag.outputs.BUILT_TAG }}
-      TARGET_TAG: ${{ steps.compare-tags.outputs.TARGET_TAG }}
-      TARGET_TAG_FIKA: ${{ steps.get-fika-tag.outputs.TARGET_TAG}}
-      SPT_VERSION: ${{ steps.versions.outputs.SPT_VERSION }}
-      EFT_VERSION: ${{ steps.versions.outputs.EFT_VERSION }}
-      SPT_SERVER_COMMIT: ${{ steps.versions.outputs.SPT_SERVER_COMMIT }}
-      SPT_SERVER_COMMIT_TIME: ${{ steps.versions.outputs.SPT_SERVER_COMMIT_TIME }}
-      BUILD_DATE: ${{ steps.versions.outputs.DATE }}
-      BUILD_DATE_TIME: ${{ steps.versions.outputs.DATE_TIME }}
+      proceed: ${{ steps.check-existence.outputs.proceed }}
+      is_nightly: ${{ steps.determine-context.outputs.is_nightly }}
+      target_tag: ${{ steps.determine-context.outputs.target_tag }}
+      build_type: ${{ steps.determine-build-type.outputs.build_type }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Get Latest Tag From SPT
-        id: get-latest-tag
-        run: |
-          git clone -b ${{ env.RELEASE_BRANCH }} ${{ env.SERVER_URL }}/${{ env.REPOSITORY_SPT_SERVER }}.git Server
-          cd Server
-          SPT_SERVER_LATEST_TAG=$(git describe --tags --abbrev=0)
-          echo "👽 SPT_SERVER_LATEST_TAG = $SPT_SERVER_LATEST_TAG"
-          echo "SPT_SERVER_LATEST_TAG=$SPT_SERVER_LATEST_TAG" >> $GITHUB_OUTPUT
+      - name: Determine Build Context
+        id: determine-context
         shell: bash
-
-      - name: Compare Tags
-        id: compare-tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CLIENT_PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          WORKFLOW_INPUT_TAG: ${{ github.event.inputs.buildTag }}
         run: |
-          source trigger.release
-          server_last_built_tag=$server
-          server_latest_tag=${{ steps.get-latest-tag.outputs.SPT_SERVER_LATEST_TAG }}
-          if [ "$server_last_built_tag" != "$server_latest_tag" ]; then
-            echo "✅ There is different between last-built-tag and lastest-tag, continue to build."
-            echo "BUILT_TAG=$server_last_built_tag" >> $GITHUB_OUTPUT
-            echo "TARGET_TAG=$server_latest_tag" >> $GITHUB_OUTPUT
-            echo "PROCEED=true" >> $GITHUB_OUTPUT
+          echo "Determining build context..."
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            echo "is_nightly=true" >> $GITHUB_OUTPUT
+            echo "Context is nightly build"
           else
-            echo "✋ last-built-tag and latest-tag are the same, stop building."
-            echo "PROCEED=false" >> $GITHUB_OUTPUT
+            echo "is_nightly=false" >> $GITHUB_OUTPUT
+            # Determine the tag based on the event type
+            if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+              TAG_NAME="$WORKFLOW_INPUT_TAG"
+            elif [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+              TAG_NAME="$CLIENT_PAYLOAD_TAG"
+            else
+              echo "Unsupported event: $EVENT_NAME"
+              exit 1
+            fi
+
+            if [[ -z "$TAG_NAME" ]]; then
+              echo "No tag provided in event payload."
+              exit 1
+            fi
+            echo "target_tag=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "Target tag is $TAG_NAME"
           fi
-        shell: bash
 
-      - name: Get Fika-Server Latest Tag
-        id: get-fika-tag
-        if: steps.compare-tags.outputs.PROCEED == 'true'
+      - name: Determine Build Type
+        id: determine-build-type
+        shell: bash
         run: |
-          source trigger.release
-          fika_built_tag=$fika
-          fika_latest_tag=$(git ls-remote --tags https://github.com/project-fika/Fika-Server.git | sort -t/ -k3 -V | tail -n 1 | awk '{print $2}' | sed 's/refs\/tags\///')
-          echo "BUILT_TAG=$fika_built_tag" >> $GITHUB_OUTPUT
-          echo "TARGET_TAG=$fika_latest_tag" >> $GITHUB_OUTPUT
-        shell: bash
+          if [[ "${{ steps.determine-context.outputs.is_nightly }}" == "true" ]]; then
+            BUILD_TYPE="nightly"
+          else
+            TARGET_TAG="${{ steps.determine-context.outputs.target_tag }}"
+            TARGET_TAG_UPPER="${TARGET_TAG^^}"
 
-      - name: Extract versions
-        id: versions
-        if: steps.compare-tags.outputs.PROCEED == 'true'
+            BUILD_TYPE="debug"
+            if [[ "$TARGET_TAG_UPPER" =~ -BEM ]]; then
+              BUILD_TYPE="bleedingmods"
+            elif [[ "$TARGET_TAG_UPPER" =~ -BE ]]; then
+              BUILD_TYPE="bleeding"
+            elif [[ "$TARGET_TAG_UPPER" =~ v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              BUILD_TYPE="release"
+            fi
+          fi
+          echo "build_type=$BUILD_TYPE" >> $GITHUB_OUTPUT
+          echo "Build type is $BUILD_TYPE"
+
+      - name: Check Existence
+        id: check-existence
+        shell: bash
         run: |
-          cd Server
-          SERVER_TAG=${{ steps.get-latest-tag.outputs.SPT_SERVER_LATEST_TAG }}
-          git checkout $SERVER_TAG
-          SPT_SERVER_COMMIT=$(git rev-parse --short $SERVER_TAG)
-          SPT_SERVER_COMMIT_TIME=$(git log --pretty=format:"%ai" -1)
+          PROCEED="true"
+          if [[ "${{ steps.determine-context.outputs.is_nightly }}" == "true" ]]; then
+            echo "Nightly build, no tag check needed."
+          else
+            TAG="${{ steps.determine-context.outputs.target_tag }}"
+            REPO="https://github.com/your-org/your-repo.git"
+            echo "Checking for tag $TAG in $REPO..."
+            if ! git ls-remote --tags $REPO $TAG | grep -q $TAG; then
+              echo "Tag $TAG not found in $REPO"
+              PROCEED="false"
+            fi
+          fi
+          echo "proceed=$PROCEED" >> $GITHUB_OUTPUT
+          echo "Matches found. Proceeding with build."
 
-          # Extract versions from core.json
-          cp -v project/assets/configs/core.json .
-          SPT_VERSION=$(jq -r '.sptVersion' core.json)
-          EFT_VERSION=$(jq -r '.compatibleTarkovVersion' core.json)
+      - name: Tag Not Found
+        if: steps.check-existence.outputs.proceed == 'false'
+        run: |
+          echo "Required tag not found in repository, halting workflow."
+          exit 1
 
-          echo "👽 SPT_VERSION = $SPT_VERSION"
-          echo "👽 EFT_VERSION = $EFT_VERSION"
-          echo "👽 SERVER_TAG = $SERVER_TAG"
-          echo "👽 SPT_SERVER_COMMIT = $SPT_SERVER_COMMIT"
-          echo "👽 SPT_SERVER_COMMIT_TIME = $SPT_SERVER_COMMIT_TIME"
-
-          echo "SPT_VERSION=$SPT_VERSION" >> $GITHUB_OUTPUT
-          echo "EFT_VERSION=$EFT_VERSION" >> $GITHUB_OUTPUT
-          echo "SPT_SERVER_COMMIT=$SPT_SERVER_COMMIT" >> $GITHUB_OUTPUT
-          echo "SPT_SERVER_COMMIT_TIME=$SPT_SERVER_COMMIT_TIME" >> $GITHUB_OUTPUT
-
-          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_OUTPUT
-          echo "DATE_TIME=$(date +%Y%m%d%H%M%S)" >> $GITHUB_OUTPUT
-        shell: bash
-
-  build-server-linux:
+  build-linux-server:
     needs: prepare
-    if: ${{ needs.prepare.outputs.PROCEED == 'true' }}
+    if: needs.prepare.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    env:
-      OUTPUT_DIR: spt-server
-      SOURCECODE_DIR: ${{ github.workspace }}/code
-
-      DOCKERHUB_USER: stblog
-      DOCKERHUB_REPOSITORY: spt-server
-      GHCR_USER: airryco
-      GHCR_REPOSITORY: spt-server
-    outputs:
-      LINUX_COMMIT_ID: ${{ steps.debug-info.outputs.COMMIT_ID }}
-      LINUX_COMMIT_ID_WHOLE: ${{ steps.debug-info.outputs.COMMIT_ID_WHOLE }}
-      LINUX_ARTIFACT: ${{ steps.filename.outputs.LINUX_ARTIFACT }}
-      LINUX_RELEASE_FILE: ${{ steps.filename.outputs.LINUX_RELEASE }}
-      LINUX_RELEASE_FIKA_FILE: ${{ steps.filename.outputs.LINUX_RELEASE_FIKA }}
-
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Git Config
+      - name: Install dependencies
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "bot@github.com"
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
 
-      - name: Clone AirryCo's Linux Server Code
+      - name: Build Linux server
         run: |
-          git clone -b ${{ env.RELEASE_BRANCH }} ${{ env.SERVER_URL }}/${{ env.REPOSITORY_SPT_SERVER_AIRRYCO }} ${{ env.SOURCECODE_DIR }}
-          cd ${{ env.SOURCECODE_DIR }}
-          git lfs pull
-        shell: bash
+          mkdir -p build
+          cd build
+          cmake ..
+          make -j$(nproc)
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20.11.1
-
-      - name: Merge Server Code From SPT
-        run: |
-          cd ${{ env.SOURCECODE_DIR }}
-          git pull
-          git fetch -u ${{ env.SERVER_URL }}/${{ env.REPOSITORY_SPT_SERVER }}.git ${{ env.RELEASE_BRANCH }}:SPT-${{ env.RELEASE_BRANCH }}
-          git merge -m "🤖 Merge tag \`${{ needs.prepare.outputs.TARGET_TAG }}\` from SPT" --no-ff ${{ needs.prepare.outputs.TARGET_TAG }}
-        shell: bash
-
-      - name: Runner Debug Information
-        id: debug-info
-        run: |
-          cp -v ${{ env.SOURCECODE_DIR }}/project/package.json .
-          cd ${{ env.SOURCECODE_DIR }}
-          echo "git version: $(git --version)"
-          echo "git lfs version: $(git-lfs --version)"
-          echo "node.js version: $(node --version)"
-          echo "npm version: $(npm --version)"
-          echo "latest commit hash: $(git rev-parse HEAD)"
-          echo "last commit message:" && git log -1 --pretty=%B
-          echo "COMMIT_ID=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "COMMIT_ID_WHOLE=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Cache NPM Dependencies
-        id: cache-npm-dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ${{ env.SOURCECODE_DIR }}/project/node_modules
-          key: ${{ runner.os }}-npm-dependencies-${{ hashFiles('package.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-dependencies-
-
-      - name: Install NPM Dependencies
-        if: steps.cache-npm-dependencies.outputs.cache-hit != 'true'
-        run: |
-          cd ${{ env.SOURCECODE_DIR }}/project
-          npm install
-        shell: bash
-
-      - name: Build Linux Server
-        id: build-server
-        run: |
-          cd ${{ env.SOURCECODE_DIR }}/project
-          npm run build:release
-          ls -l build
-          mv build ${{ env.OUTPUT_DIR }}
-        shell: bash
-
-      - name: Generate Linux File Name
-        id: filename
-        run: |
-          artifact_name=${{ env.OUTPUT_DIR }}-${{ needs.prepare.outputs.TARGET_TAG }}-linux-release-${{ steps.debug-info.outputs.COMMIT_ID }}-EFT${{ needs.prepare.outputs.EFT_VERSION }}-${{ needs.prepare.outputs.BUILD_DATE_TIME }}-artifact
-          release_name=${{ env.OUTPUT_DIR }}-${{ needs.prepare.outputs.TARGET_TAG }}-linux-release-${{ steps.debug-info.outputs.COMMIT_ID }}-EFT${{ needs.prepare.outputs.EFT_VERSION }}-${{ needs.prepare.outputs.BUILD_DATE_TIME }}
-          echo "LINUX_ARTIFACT=$artifact_name" >> $GITHUB_OUTPUT
-          echo "LINUX_RELEASE=$release_name.zip" >> $GITHUB_OUTPUT
-          echo "LINUX_RELEASE_FIKA=$release_name-fika.zip" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Artifact Linux Server
+      - name: Save build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.filename.outputs.LINUX_ARTIFACT }}
-          path: ${{ env.SOURCECODE_DIR }}/project/${{ env.OUTPUT_DIR }}
-          overwrite: true
+          name: linux-server-build
+          path: build/
 
-      - name: Push Linux Server Code And Tag
+  build-docker-image:
+    needs: build-linux-server
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-server-build
+          path: build/
+
+      - name: Build Docker image for ARM64
         run: |
-          cd ${{ env.SOURCECODE_DIR }}
-          git pull
-          REMOTE_URL="https://AirryCo:${{ secrets.AIRRYCO_TOKEN }}@github.com/${{ env.REPOSITORY_SPT_SERVER_AIRRYCO }}.git"
-          git remote set-url origin "$REMOTE_URL"
-          git push
-          git tag -d ${{ needs.prepare.outputs.TARGET_TAG }}
-          git tag ${{ needs.prepare.outputs.TARGET_TAG }}
-          git push -u origin ${{ env.RELEASE_BRANCH }}
-          git push -u origin ${{ needs.prepare.outputs.TARGET_TAG }}
+          docker buildx build \
+            --platform linux/arm64 \
+            -t ${{ secrets.DOCKER_HUB_USERNAME }}/linux-server:latest \
+            -t ${{ secrets.DOCKER_HUB_USERNAME }}/linux-server:${{ github.sha }} \
+            --push \
+            .
+
+  post-build:
+    needs: build-docker-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Build Info to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          BUILD_TYPE: ${{ needs.prepare.outputs.build_type }}
+          DOCKER_IMAGE: ${{ secrets.DOCKER_HUB_USERNAME }}/linux-server:${{ github.sha }}
         shell: bash
+        run: |
+          TIMESTAMP=$(date --iso-8601=seconds)
+          FOOTER_MESSAGES=("You look great today!" "Don't ban me, Phantom!" "Powered by coffee" "Life's too short to remove USB safely" "Did you remember to hydrate today?" "Have you tried turning it off and on again?" "There's no place like 127.0.0.1" "In Chomp we trust" "Beep boop, I'm a bot" "Keep calm and commit your code" "This isn't a bug, it's an undocumented feature." "May the source be with you" "Go to bed, Terk" "Please direct all support requests to Drakia" "Meaw" "Chomp approves of this message" "Chomp is life, Chomp is love" "Drakia denies all involvement" "Drakia left this note here just to confuse you" "Katalyst is the reason we can’t have nice things" "Katalyst voted against this message" "Powered by caffeine, chaos, and Chomp" "RaiRai says hi-hi" "RaiRai wants to remind you that sarcasm is a skill" "Refringe just wobbled" "Refringe might be watching--Or coding--Probably both" "Refringe rewrote this embed thirty times" "Refringe, professional button-pusher extraordinaire" "Sarix would like you to reconsider your choices" "Stella is currently judging your grammar" "Stella just gave this embed a 6/10" "Waffle has entered the chat, and now it’s weird" "Waffle is too busy stacking layers of chaos" "Waffle would like to speak to the manager of logic")
+          FOOTER_MESSAGE="${FOOTER_MESSAGES[$RANDOM % ${#FOOTER_MESSAGES[@]}]}"
+
+          EMBED_COLOR=5763719
+          EMBED_DESCRIPTION="A new Docker image has been built and pushed to Docker Hub."
+
+          fields_json='[
+            {"name": "Build Type", "value": "'"$BUILD_TYPE"'", "inline": true},
+            {"name": "Docker Image", "value": "'"$DOCKER_IMAGE"'", "inline": true}
+          ]'
+
+          payload=$(jq -n \
+            --argjson fields "$fields_json" \
+            --arg EMBED_DESCRIPTION "$EMBED_DESCRIPTION" \
+            --argjson EMBED_COLOR "$EMBED_COLOR" \
+            --arg FOOTER_MESSAGE "$FOOTER_MESSAGE" \
+            --arg TIMESTAMP "$TIMESTAMP" \
+            '{
+              "content": $EMBED_DESCRIPTION,
+              "embeds": [
+                {
+                  "title": "Build Information",
+                  "color": $EMBED_COLOR,
+                  "fields": $fields,
+                  "footer": {"text": $FOOTER_MESSAGE, "icon_url": "https://i.imgur.com/28JJJec.png"},
+                  "timestamp": $TIMESTAMP
+                }
+              ],
+              "username": "BuildBot",
+              "avatar_url": "https://i.imgur.com/28JJJec.png"
+            }')
+          echo "$payload" > payload_discord.json
+
+          echo "Payload Generated:"
+          cat payload_discord.json
+
+          echo "Sending Payload..."
+          curl -H "Content-Type: application/json" \
+            -X POST \
+            --data-binary @payload_discord.json \
+            $DISCORD_WEBHOOK_URL
